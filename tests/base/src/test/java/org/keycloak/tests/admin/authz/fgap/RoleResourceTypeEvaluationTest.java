@@ -64,6 +64,8 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.hasKey;
+import static org.hamcrest.Matchers.hasProperty;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -514,6 +516,121 @@ public class RoleResourceTypeEvaluationTest extends AbstractPermissionTest {
         }
     }
 
+    /**
+     * A delegated administrator that may assign a realm role must also see that the role is assigned, otherwise the
+     * role can be granted but never reviewed or removed. A role the administrator holds no permission on stays hidden.
+     *
+     * @see <a href="https://github.com/keycloak/keycloak/issues/52727">#52727</a>
+     */
+    @Test
+    public void testAssignedRealmRoleVisibleWithMapRolePermission() {
+        UserRepresentation myadmin = realm.admin().users().search("myadmin").get(0);
+        UserRepresentation targetUser = createUser("targetUser");
+        RoleRepresentation mappableRole = createRealmRole("MAPPABLE_REALM_ROLE");
+        RoleRepresentation hiddenRole = createRealmRole("HIDDEN_REALM_ROLE");
+        realm.admin().users().get(targetUser.getId()).roles().realmLevel().add(List.of(mappableRole, hiddenRole));
+
+        UserPolicyRepresentation policy = createUserPolicy(realm, adminPermissionsClient, "Only My Admin User Policy", myadmin.getId());
+        createPermission(adminPermissionsClient, targetUser.getId(), AdminPermissionsSchema.USERS_RESOURCE_TYPE, Set.of(VIEW), policy);
+        createPermission(adminPermissionsClient, mappableRole.getId(), rolesType, Set.of(MAP_ROLE), policy);
+
+        // GET /users/{id}/role-mappings
+        MappingsRepresentation mappings = realmAdminClient.realm(realm.getName()).users().get(targetUser.getId()).roles().getAll();
+        assertThat(mappings.getRealmMappings(), hasItem(hasProperty("name", equalTo("MAPPABLE_REALM_ROLE"))));
+        assertThat(mappings.getRealmMappings(), not(hasItem(hasProperty("name", equalTo("HIDDEN_REALM_ROLE")))));
+
+        // the console reads the inherited list from ui-ext, so both endpoints have to agree
+        String body = getUiExtEndpoint("effective-roles-all/users/" + targetUser.getId());
+        assertThat(body, containsString("MAPPABLE_REALM_ROLE"));
+        assertThat(body, not(containsString("HIDDEN_REALM_ROLE")));
+
+        // the console follows the role name to GET /roles-by-id/{id}, which has to agree with the list
+        assertThat(realmAdminClient.realm(realm.getName()).rolesById().getRole(mappableRole.getId()).getName(), equalTo("MAPPABLE_REALM_ROLE"));
+        try {
+            realmAdminClient.realm(realm.getName()).rolesById().getRole(hiddenRole.getId());
+            fail("Expected ForbiddenException for a realm role without any permission");
+        } catch (Exception ex) {
+            assertThat(ex, instanceOf(ForbiddenException.class));
+        }
+    }
+
+    /**
+     * Only a permission granted on the role itself makes a client role of a hidden client visible. The manage-users
+     * role lets an administrator assign any role, but it must not disclose clients the administrator cannot view.
+     *
+     * @see <a href="https://github.com/keycloak/keycloak/issues/50581">#50581</a>
+     */
+    @Test
+    public void testAssignedClientRoleVisibleOnlyWithMapRolePermission() {
+        UserRepresentation myadmin = realm.admin().users().search("myadmin").get(0);
+        UserRepresentation targetUser = createUser("targetUser");
+        ClientRepresentation mappableClient = createClient("mappable-client");
+        ClientRepresentation secretClient = createClient("secret-client");
+        RoleRepresentation mappableRole = createClientRole(mappableClient, "MAPPABLE_CLIENT_ROLE");
+        RoleRepresentation siblingRole = createClientRole(mappableClient, "SIBLING_CLIENT_ROLE");
+        RoleRepresentation secretRole = createClientRole(secretClient, "SECRET_CLIENT_ROLE");
+        realm.admin().users().get(targetUser.getId()).roles().clientLevel(mappableClient.getId()).add(List.of(mappableRole, siblingRole));
+        realm.admin().users().get(targetUser.getId()).roles().clientLevel(secretClient.getId()).add(List.of(secretRole));
+
+        UserPolicyRepresentation policy = createUserPolicy(realm, adminPermissionsClient, "Only My Admin User Policy", myadmin.getId());
+        createPermission(adminPermissionsClient, targetUser.getId(), AdminPermissionsSchema.USERS_RESOURCE_TYPE, Set.of(VIEW), policy);
+        createPermission(adminPermissionsClient, mappableRole.getId(), rolesType, Set.of(MAP_ROLE), policy);
+
+        // manage-users lets myadmin assign every role, but grants no view on any client
+        String realmMgmtId = realm.admin().clients().findByClientId("realm-management").get(0).getId();
+        RoleRepresentation manageUsersRole = realm.admin().clients().get(realmMgmtId).roles().get(AdminRoles.MANAGE_USERS).toRepresentation();
+        realm.admin().users().get(myadmin.getId()).roles().clientLevel(realmMgmtId).add(List.of(manageUsersRole));
+        realmAdminClient.tokenManager().grantToken();
+
+        // GET /users/{id}/role-mappings
+        MappingsRepresentation mappings = realmAdminClient.realm(realm.getName()).users().get(targetUser.getId()).roles().getAll();
+        Map<String, ClientMappingsRepresentation> clientMappings = mappings.getClientMappings();
+        assertThat(clientMappings, hasKey("mappable-client"));
+        assertThat(clientMappings.get("mappable-client").getMappings(), hasItem(hasProperty("name", equalTo("MAPPABLE_CLIENT_ROLE"))));
+        assertThat(clientMappings.get("mappable-client").getMappings(), not(hasItem(hasProperty("name", equalTo("SIBLING_CLIENT_ROLE")))));
+        assertThat(clientMappings, not(hasKey("secret-client")));
+
+        // GET /ui-ext/effective-roles/users/{id} and /ui-ext/effective-roles-all/users/{id}
+        for (String subPath : List.of("effective-roles/users/", "effective-roles-all/users/")) {
+            String body = getUiExtEndpoint(subPath + targetUser.getId());
+            assertThat(body, containsString("MAPPABLE_CLIENT_ROLE"));
+            assertThat(body, not(containsString("SIBLING_CLIENT_ROLE")));
+            assertThat(body, not(containsString("secret-client")));
+        }
+    }
+
+    /**
+     * Composite membership is granted with MAP_ROLE_COMPOSITE, so that scope has to make the child role visible in the
+     * composite listings of the admin API and ui-ext alike.
+     */
+    @Test
+    public void testCompositeChildVisibleWithMapRoleCompositePermission() {
+        UserRepresentation myadmin = realm.admin().users().search("myadmin").get(0);
+        ClientRepresentation visibleClient = createClient("visible-client");
+        ClientRepresentation secretClient = createClient("secret-client");
+        RoleRepresentation parent = createClientRole(visibleClient, "VISIBLE_PARENT");
+        RoleRepresentation mappableChild = createClientRole(secretClient, "MAPPABLE_CHILD");
+        RoleRepresentation secretChild = createClientRole(secretClient, "SECRET_CHILD");
+        realm.admin().clients().get(visibleClient.getId()).roles().get("VISIBLE_PARENT").addComposites(List.of(mappableChild, secretChild));
+
+        UserPolicyRepresentation policy = createUserPolicy(realm, adminPermissionsClient, "Only My Admin User Policy", myadmin.getId());
+        createPermission(adminPermissionsClient, visibleClient.getId(), AdminPermissionsSchema.CLIENTS_RESOURCE_TYPE, Set.of(VIEW), policy);
+        createPermission(adminPermissionsClient, mappableChild.getId(), rolesType, Set.of(MAP_ROLE_COMPOSITE), policy);
+
+        // GET /roles-by-id/{id}/composites
+        List<String> composites = realmAdminClient.realm(realm.getName()).rolesById().getRoleComposites(parent.getId())
+                .stream().map(RoleRepresentation::getName).toList();
+        assertThat(composites, hasItem("MAPPABLE_CHILD"));
+        assertThat(composites, not(hasItem("SECRET_CHILD")));
+
+        // GET /ui-ext/role-mappings/roles/{id} and /ui-ext/effective-roles-all/roles/{id}
+        for (String subPath : List.of("role-mappings/roles/", "effective-roles-all/roles/")) {
+            String body = getUiExtEndpoint(subPath + parent.getId());
+            assertThat(body, containsString("MAPPABLE_CHILD"));
+            assertThat(body, not(containsString("SECRET_CHILD")));
+        }
+    }
+
     @Test
     public void testUiExtEndpointsFilterHiddenCompositeRoles() {
         UserRepresentation myadmin = realm.admin().users().search("myadmin").get(0);
@@ -686,6 +803,37 @@ public class RoleResourceTypeEvaluationTest extends AbstractPermissionTest {
         assertThat(allClientRoleNames, not(hasItem("SECRET_CHILD")));
         assertThat("secret-client should not appear in client mappings",
                 clientMappings.containsKey("secret-client"), equalTo(false));
+    }
+
+    private RoleRepresentation createRealmRole(String name) {
+        RoleRepresentation role = new RoleRepresentation();
+        role.setName(name);
+        realm.admin().roles().create(role);
+        realm.cleanup().add(r -> r.roles().get(name).remove());
+        return realm.admin().roles().get(name).toRepresentation();
+    }
+
+    private ClientRepresentation createClient(String clientId) {
+        ClientRepresentation client = new ClientRepresentation();
+        client.setClientId(clientId);
+        try (Response response = realm.admin().clients().create(client)) {
+            client.setId(ApiUtil.getCreatedId(response));
+        }
+        return client;
+    }
+
+    private RoleRepresentation createClientRole(ClientRepresentation client, String name) {
+        RoleRepresentation role = new RoleRepresentation();
+        role.setName(name);
+        realm.admin().clients().get(client.getId()).roles().create(role);
+        return realm.admin().clients().get(client.getId()).roles().get(name).toRepresentation();
+    }
+
+    private String getUiExtEndpoint(String subPath) {
+        try (Client httpClient = Keycloak.getClientProvider().newRestEasyClient(null, null, true)) {
+            return getUiExtEndpoint(httpClient, keycloakUrls.getBaseUrl().toString(), realm.getName(), subPath,
+                    new BearerAuthFilter(realmAdminClient.tokenManager()));
+        }
     }
 
     private String getUiExtEndpoint(Client httpClient, String baseUrl, String realmName, String subPath, BearerAuthFilter bearerAuth) {

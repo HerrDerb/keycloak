@@ -1,7 +1,6 @@
 package org.keycloak.admin.ui.rest;
 
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -193,22 +192,5 @@ public class EffectiveRoleMappingResource extends RoleMappingResource {
         return roles.map(roleModel -> convertToModel(roleModel, realm))
                 .sorted(Comparator.comparing(ClientRole::getClient).thenComparing(ClientRole::getRole))
                 .collect(Collectors.toList());
-    }
-
-    private Stream<RoleModel> addSubRoles(Stream<RoleModel> roles) {
-        return addSubRoles(roles, new HashSet<>());
-    }
-    private Stream<RoleModel> addSubRoles(Stream<RoleModel> roles, HashSet<RoleModel> visited) {
-        List<RoleModel> roleList = roles.filter(s -> auth.roles().canView(s)).collect(Collectors.toList());
-        visited.addAll(roleList);
-        return Stream.concat(roleList.stream(), roleList.stream().flatMap(r -> addSubRoles(r.getCompositesStream().filter(s -> !visited.contains(s)), visited)));
-    }
-
-    private Stream<GroupModel> addParents(GroupModel group) {
-        //no cycle check here, I hope that's fine
-        if (group.getParent() == null) {
-            return Stream.of(group);
-        }
-        return Stream.concat(Stream.of(group), addParents(group.getParent()));
     }
 }

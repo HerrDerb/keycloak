@@ -77,6 +77,10 @@ public interface RolePermissionEvaluator {
      * If the role is a realm role, it returns {@code true} if {@link RealmPermissions#canViewRealm()} returns {@code true}.
      * <p/>
      * If the role is a client role, it returns {@code true} if {@link ClientPermissions#canView(ClientModel)} returns {@code true}.
+     * <p/>
+     * With admin permissions V2 it also returns {@code true} if the caller is granted a role-level scope
+     * (map-role, map-role-composite or map-role-client-scope) on the role: an administrator allowed to assign a role
+     * has to be able to see where it is assigned.
      */
     boolean canView(RoleModel role);
 

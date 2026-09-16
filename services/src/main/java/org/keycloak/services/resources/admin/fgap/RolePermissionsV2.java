@@ -17,6 +17,7 @@
 
 package org.keycloak.services.resources.admin.fgap;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 
@@ -38,11 +39,35 @@ import static org.keycloak.authorization.fgap.AdminPermissionsSchema.ROLES_RESOU
 
 class RolePermissionsV2 extends RolePermissions {
 
+    private static final Set<String> ROLE_LEVEL_SCOPES = Set.of(AdminPermissionsSchema.MAP_ROLE,
+            AdminPermissionsSchema.MAP_ROLE_COMPOSITE, AdminPermissionsSchema.MAP_ROLE_CLIENT_SCOPE);
+
     private final FineGrainedAdminPermissionEvaluator eval;
+    // role listings evaluate the same role many times per request, and every policy evaluation is expensive
+    private final Map<String, Boolean> roleLevelGrant = new HashMap<>();
 
     RolePermissionsV2(KeycloakSession session, RealmModel realm, AuthorizationProvider authz, MgmtPermissions root) {
         super(session, realm, authz, root);
         this.eval = new FineGrainedAdminPermissionEvaluator(session, root, resourceStore, policyStore);
+    }
+
+    @Override
+    public boolean canView(RoleModel role) {
+        return super.canView(role) || hasRoleLevelGrant(role);
+    }
+
+    /**
+     * Whether the caller is granted any scope on this role in particular. Deliberately not {@link #canMapRole(RoleModel)}:
+     * manage-users or map-roles on the client let an administrator assign any role, but they do not make a client
+     * the administrator cannot view visible.
+     */
+    private boolean hasRoleLevelGrant(RoleModel role) {
+        Boolean granted = roleLevelGrant.get(role.getId());
+        if (granted == null) {
+            granted = ROLE_LEVEL_SCOPES.stream().anyMatch(scope -> eval.hasPermission(new RoleModelRecord(role), null, scope));
+            roleLevelGrant.put(role.getId(), granted);
+        }
+        return granted;
     }
 
     @Override
